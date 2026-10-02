@@ -1,0 +1,485 @@
+name: PrivateRDP v2.4.0 LOW-LATENCY + WINDOW-GUARD
+
+on:
+  workflow_dispatch:
+    inputs:
+      room_code:
+        description: "Room code (same as Android)"
+        required: false
+        default: "PRIVATE-RDP-2026"
+      width:
+        description: "Exact Windows/stream width (itel S23 native 1612)"
+        required: false
+        default: "1612"
+      height:
+        description: "Encoded/fullscreen height"
+        required: false
+        default: "720"
+      fps:
+        description: "Target FPS (15-60)"
+        required: false
+        default: "60"
+      bitrate_mbps:
+        description: "H264 bitrate cap Mbps (VBV max, hard max 10)"
+        required: false
+        default: "5.0"
+      crf:
+        description: "x264 quality (lower=sharper, 18-28; 22 default)"
+        required: false
+        default: "22"
+      sndbuf_kb:
+        description: "TCP send buffer KB (smaller = lower latency under congestion, 128-512)"
+        required: false
+        default: "256"
+      window_guard:
+        description: "1 = auto-move app windows that open outside the streamed display"
+        required: false
+        default: "1"
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 355
+    permissions:
+      contents: read
+    env:
+      RDP_SIGNAL_URL: wss://universal-usb-signal.reiseakari.workers.dev/ws
+    steps:
+      - name: Runner performance tuning (non-fatal)
+        shell: pwsh
+        run: |
+          try { powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null; Write-Host 'power plan: High performance' } catch { Write-Host "powercfg non-fatal: $_" }
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop; Write-Host 'Defender realtime scan: off' } catch { Write-Host "Defender tweak non-fatal: $_" }
+          try { Set-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value '0' -ErrorAction Stop } catch { }
+          try { Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name VisualFXSetting -Value 2 -ErrorAction Stop } catch { }
+          Get-CimInstance Win32_Processor | ForEach-Object { Write-Host "CPU: $($_.Name) cores=$($_.NumberOfCores) logical=$($_.NumberOfLogicalProcessors)" }
+
+      - name: Join Runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+          log-mode: quiet
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install v2 runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --upgrade pip
+          python -m pip install "websockets>=14,<16" "numpy>=2,<3" "mss==10.2.0" "dxcam[winrt]==0.3.0" "av>=14,<17" "soundcard==0.4.5"
+          try { Set-Service AudioEndpointBuilder -StartupType Automatic; Start-Service AudioEndpointBuilder } catch { Write-Host "AudioEndpointBuilder start non-fatal: $_" }
+          try { Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv } catch { Write-Host "Windows Audio start non-fatal: $_" }
+          python -c "import av; c=av.CodecContext.create('libx264','w'); print('libx264 encoder:', c.name)"
+
+      - name: Resolve Tailscale address and firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $ip=(tailscale ip -4 | Select-Object -First 1).Trim()
+          if(-not $ip.StartsWith('100.')){ throw "No Tailscale IPv4: $ip" }
+          "RDP_TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Runner Tailscale IP: $ip"
+          'PrivateRDP v2 UDP','PrivateRDP v2 CONTROL','PrivateRDP v2 VIDEO','PrivateRDP v2 AUDIO' | ForEach-Object { Remove-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue }
+          New-NetFirewallRule -DisplayName 'PrivateRDP v2 UDP' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 49100 -RemoteAddress '100.64.0.0/10' | Out-Null
+          New-NetFirewallRule -DisplayName 'PrivateRDP v2 CONTROL' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 49101 -RemoteAddress '100.64.0.0/10' | Out-Null
+          New-NetFirewallRule -DisplayName 'PrivateRDP v2 VIDEO' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 49102 -RemoteAddress '100.64.0.0/10' | Out-Null
+          New-NetFirewallRule -DisplayName 'PrivateRDP v2 AUDIO' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 49103 -RemoteAddress '100.64.0.0/10' | Out-Null
+          tailscale status
+          try { tailscale netcheck } catch { Write-Host 'tailscale netcheck unavailable (non-fatal)' }
+
+      - name: Activate exact 1612x720 VDD display - hard required
+        shell: pwsh
+        env:
+          TARGET_W: ${{ inputs.width }}
+          TARGET_H: ${{ inputs.height }}
+          TARGET_HZ: "60"
+        run: |
+          $ErrorActionPreference='Stop'
+          $w=[int]$env:TARGET_W
+          $h=[int]$env:TARGET_H
+          $hz=[int]$env:TARGET_HZ
+          if(($w -band 1) -ne 0 -or ($h -band 1) -ne 0){ throw 'H264 4:2:0 target dimensions must be even' }
+
+          Write-Host "=== PrivateRDP v2.3.5.1 exact display bootstrap ==="
+          Write-Host "Requested: ${w}x${h}@${hz}"
+          Write-Host "Policy: exact VDD required; no 1600x900 fallback, no letterbox, no crop, no stretch"
+
+          Add-Type -AssemblyName System.Windows.Forms
+
+          function Test-ExactActive {
+            foreach($s in [System.Windows.Forms.Screen]::AllScreens){
+              Write-Host "SCREEN before/now: device=$($s.DeviceName) primary=$($s.Primary) bounds=$($s.Bounds)"
+              if($s.Bounds.Width -eq $w -and $s.Bounds.Height -eq $h){ return $true }
+            }
+            return $false
+          }
+
+          if(Test-ExactActive){
+            Write-Host "EXACT DISPLAY already active."
+            "RDP_EXACT_DISPLAY=1" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+            exit 0
+          }
+
+          # Use the same VDD configuration shape and install path that the standalone
+          # v0.2.1 probe proved as PASS_EXACT_ACTIVE on Windows Server 2022 and 2025.
+          $vddRoot='C:\VirtualDisplayDriver'
+          New-Item -ItemType Directory -Path $vddRoot -Force | Out-Null
+          New-Item -ItemType Directory -Path "$vddRoot\Logs" -Force | Out-Null
+
+          $xml=@"
+          <?xml version='1.0' encoding='utf-8'?>
+          <vdd_settings>
+            <monitors><count>1</count></monitors>
+            <gpu><friendlyname>default</friendlyname></gpu>
+            <global><g_refresh_rate>$hz</g_refresh_rate></global>
+            <resolutions>
+              <resolution>
+                <width>$w</width>
+                <height>$h</height>
+                <refresh_rate>$hz</refresh_rate>
+              </resolution>
+            </resolutions>
+            <logging>
+              <SendLogsThroughPipe>true</SendLogsThroughPipe>
+              <logging>true</logging>
+              <debuglogging>true</debuglogging>
+            </logging>
+            <colour>
+              <SDR10bit>false</SDR10bit>
+              <HDRPlus>false</HDRPlus>
+              <ColourFormat>RGB</ColourFormat>
+            </colour>
+            <cursor>
+              <HardwareCursor>true</HardwareCursor>
+              <CursorMaxX>128</CursorMaxX>
+              <CursorMaxY>128</CursorMaxY>
+              <AlphaCursorSupport>true</AlphaCursorSupport>
+              <XorCursorSupportLevel>2</XorCursorSupportLevel>
+            </cursor>
+            <edid>
+              <CustomEdid>false</CustomEdid>
+              <PreventSpoof>false</PreventSpoof>
+              <EdidCeaOverride>false</EdidCeaOverride>
+            </edid>
+            <auto_resolutions>
+              <enabled>false</enabled>
+              <source_priority>manual</source_priority>
+              <edid_mode_filtering>
+                <min_refresh_rate>24</min_refresh_rate>
+                <max_refresh_rate>240</max_refresh_rate>
+                <exclude_fractional_rates>false</exclude_fractional_rates>
+                <min_resolution_width>640</min_resolution_width>
+                <min_resolution_height>480</min_resolution_height>
+                <max_resolution_width>7680</max_resolution_width>
+                <max_resolution_height>4320</max_resolution_height>
+              </edid_mode_filtering>
+              <preferred_mode>
+                <use_edid_preferred>false</use_edid_preferred>
+                <fallback_width>$w</fallback_width>
+                <fallback_height>$h</fallback_height>
+                <fallback_refresh>$hz</fallback_refresh>
+              </preferred_mode>
+            </auto_resolutions>
+            <color_advanced>
+              <bit_depth_management>
+                <auto_select_from_color_space>false</auto_select_from_color_space>
+                <force_bit_depth>8</force_bit_depth>
+                <fp16_surface_support>true</fp16_surface_support>
+              </bit_depth_management>
+              <color_format_extended><sdr_white_level>80.0</sdr_white_level></color_format_extended>
+            </color_advanced>
+          </vdd_settings>
+          "@
+          $enc=[System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText((Join-Path $vddRoot 'vdd_settings.xml'),$xml,$enc)
+
+          New-Item -Path 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver' -Force | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver' -Name VDDPATH -Value $vddRoot -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver' -Name LOGS -Value 1 -PropertyType DWord -Force | Out-Null
+
+          $tmp=Join-Path $env:RUNNER_TEMP 'prdp-v235-vdd'
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          $nefZip=Join-Path $tmp 'nefcon.zip'
+          $drvZip=Join-Path $tmp 'driver.zip'
+          Invoke-WebRequest 'https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip' -OutFile $nefZip -UseBasicParsing
+          Invoke-WebRequest 'https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip' -OutFile $drvZip -UseBasicParsing
+          Expand-Archive $nefZip (Join-Path $tmp 'nef') -Force
+          Expand-Archive $drvZip (Join-Path $tmp 'drv') -Force
+
+          $nefexe=Get-ChildItem (Join-Path $tmp 'nef') -Recurse -Filter nefconw.exe | Where-Object FullName -Match '\\x64\\' | Select-Object -First 1
+          $inf=Get-ChildItem (Join-Path $tmp 'drv') -Recurse -Filter MttVDD.inf | Select-Object -First 1
+          $cat=Get-ChildItem (Join-Path $tmp 'drv') -Recurse -Filter mttvdd.cat | Select-Object -First 1
+          $dll=Get-ChildItem (Join-Path $tmp 'drv') -Recurse -Filter MttVDD.dll | Select-Object -First 1
+          if(-not $nefexe -or -not $inf -or -not $cat -or -not $dll){ throw 'VDD/NefCon payload layout not recognized' }
+
+          Write-Host "VDD DLL signature:"
+          Get-AuthenticodeSignature $dll.FullName | Format-List Status,StatusMessage
+
+          $certs=New-Object Security.Cryptography.X509Certificates.X509Certificate2Collection
+          $certs.Import([IO.File]::ReadAllBytes($cat.FullName))
+          foreach($c in $certs){
+            $cp=Join-Path $tmp ($c.Thumbprint+'.cer')
+            [IO.File]::WriteAllBytes($cp,$c.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+            Import-Certificate -FilePath $cp -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+          }
+
+          # IMPORTANT: nefconw.exe can behave like a windowed native process.
+          # Calling it bare can return control before PowerShell has a usable
+          # $LASTEXITCODE (observed as a blank exit code even though NefCon logs
+          # 'Device and driver installed successfully' a moment later).
+          # The v0.2.1 probe that PASSed on both Windows 2022/2025 forced the
+          # native process through a pipeline, then used PnP ProblemCode=0 as
+          # the authoritative success condition. Mirror that proven sequence.
+          $nefLog=Join-Path $tmp 'nefcon-install.log'
+          & $nefexe.FullName install $inf.FullName 'Root\MttVDD' 2>&1 | Tee-Object -FilePath $nefLog
+          $installExit=$LASTEXITCODE
+          if($null -eq $installExit){
+            Write-Warning 'NefCon produced no immediate exit code; continuing to authoritative PnP verification.'
+          } else {
+            Write-Host "NefCon install exit=$installExit"
+            if([int]$installExit -ne 0){
+              Write-Warning "NefCon returned exit=$installExit; PnP verification will decide whether the VDD is actually usable."
+            }
+          }
+          pnputil /scan-devices 2>&1 | ForEach-Object { Write-Host $_ }
+          Start-Sleep -Seconds 15
+
+          # Wait for a healthy PnP node. The control pipe is deliberately NOT a
+          # success requirement: the successful v0.2.1 probe had pipe=False.
+          $healthy=$false
+          for($i=0;$i -lt 12;$i++){
+            $nodes=Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+              $_.InstanceId -match 'MttVDD|MTT1337|ROOT\\MTT' -or $_.FriendlyName -match 'Virtual Display|Mtt|MikeTheTech'
+            }
+            foreach($d in $nodes){
+              $pc=0
+              try{$pc=[int](Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop).Data}catch{$pc=999}
+              Write-Host "VDD PnP: status=$($d.Status) name=$($d.FriendlyName) id=$($d.InstanceId) problem=$pc"
+              if($pc -eq 0){$healthy=$true}
+            }
+            if($healthy){break}
+            Start-Sleep -Seconds 2
+          }
+          if(-not $healthy){ throw 'VDD PnP node did not become healthy (ProblemCode 0)' }
+
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Text;
+          using System.Collections.Generic;
+          using System.Runtime.InteropServices;
+          public static class PRDPExactDisplay235 {
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+            public struct DISPLAY_DEVICE { public int cb; [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string DeviceName; [MarshalAs(UnmanagedType.ByValTStr,SizeConst=128)] public string DeviceString; public int StateFlags; [MarshalAs(UnmanagedType.ByValTStr,SizeConst=128)] public string DeviceID; [MarshalAs(UnmanagedType.ByValTStr,SizeConst=128)] public string DeviceKey; }
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+            public struct DEVMODE { [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string dmDeviceName; public short dmSpecVersion,dmDriverVersion,dmSize,dmDriverExtra; public int dmFields,dmPositionX,dmPositionY,dmDisplayOrientation,dmDisplayFixedOutput; public short dmColor,dmDuplex,dmYResolution,dmTTOption,dmCollate; [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string dmFormName; public short dmLogPixels; public int dmBitsPerPel,dmPelsWidth,dmPelsHeight,dmDisplayFlags,dmDisplayFrequency; public int dmICMMethod,dmICMIntent,dmMediaType,dmDitherType,dmReserved1,dmReserved2,dmPanningWidth,dmPanningHeight; }
+            [DllImport("user32.dll",CharSet=CharSet.Ansi)] static extern bool EnumDisplayDevices(string a,uint i,ref DISPLAY_DEVICE d,uint f);
+            [DllImport("user32.dll",CharSet=CharSet.Ansi)] static extern bool EnumDisplaySettingsEx(string n,int i,ref DEVMODE m,uint f);
+            [DllImport("user32.dll",CharSet=CharSet.Ansi)] static extern int ChangeDisplaySettingsEx(string n,ref DEVMODE m,IntPtr h,uint f,IntPtr p);
+            [DllImport("user32.dll",CharSet=CharSet.Ansi)] static extern int ChangeDisplaySettingsEx(string n,IntPtr m,IntPtr h,uint f,IntPtr p);
+            const int CUR=-1, ATT=1, PRI=4; const int DM_POSITION=0x20,DM_FREQ=0x400000,DM_W=0x80000,DM_H=0x100000; const uint CDS_UP=1,CDS_TEST=2,CDS_PRIMARY=0x10;
+            static DISPLAY_DEVICE DD(){var d=new DISPLAY_DEVICE();d.cb=Marshal.SizeOf(typeof(DISPLAY_DEVICE));return d;}
+            static DEVMODE DM(){var m=new DEVMODE();m.dmSize=(short)Marshal.SizeOf(typeof(DEVMODE));return m;}
+            public static string Dump(int w,int h,int hz){
+              var sb=new StringBuilder();
+              for(uint i=0;i<32;i++){
+                var d=DD(); if(!EnumDisplayDevices(null,i,ref d,0))break;
+                sb.AppendLine($"DEV {i} {d.DeviceName} desc={d.DeviceString} flags=0x{d.StateFlags:X} id={d.DeviceID}");
+                var c=DM(); if(EnumDisplaySettingsEx(d.DeviceName,CUR,ref c,0))sb.AppendLine($" CURRENT {c.dmPelsWidth}x{c.dmPelsHeight}@{c.dmDisplayFrequency} pos={c.dmPositionX},{c.dmPositionY}");
+                bool ex=false;
+                for(int x=0;x<4096;x++){
+                  var m=DM(); if(!EnumDisplaySettingsEx(d.DeviceName,x,ref m,0))break;
+                  if(m.dmPelsWidth==w&&m.dmPelsHeight==h&&(hz<=0||m.dmDisplayFrequency==hz))ex=true;
+                }
+                sb.AppendLine(" EXACT_EXPOSED="+ex);
+              }
+              return sb.ToString();
+            }
+            public static string Apply(int w,int h,int hz){
+              var sb=new StringBuilder(); bool any=false;
+              for(uint i=0;i<32;i++){
+                var d=DD(); if(!EnumDisplayDevices(null,i,ref d,0))break;
+                DEVMODE best=DM(); bool have=false;
+                for(int x=0;x<4096;x++){
+                  var m=DM(); if(!EnumDisplaySettingsEx(d.DeviceName,x,ref m,0))break;
+                  if(m.dmPelsWidth==w&&m.dmPelsHeight==h&&(hz<=0||m.dmDisplayFrequency==hz)){best=m;have=true;break;}
+                }
+                if(!have)continue;
+                any=true;
+                var t=best;
+                int tr=ChangeDisplaySettingsEx(d.DeviceName,ref t,IntPtr.Zero,CDS_TEST,IntPtr.Zero);
+                sb.AppendLine($"TEST {d.DeviceName} {d.DeviceString} result={tr}");
+                if(tr==0){
+                  best.dmFields|=DM_W|DM_H|DM_POSITION;
+                  if(best.dmDisplayFrequency>0)best.dmFields|=DM_FREQ;
+                  best.dmPositionX=0; best.dmPositionY=0;
+                  int ar=ChangeDisplaySettingsEx(d.DeviceName,ref best,IntPtr.Zero,CDS_UP|CDS_PRIMARY,IntPtr.Zero);
+                  int cr=ChangeDisplaySettingsEx(null,IntPtr.Zero,IntPtr.Zero,0,IntPtr.Zero);
+                  sb.AppendLine($"APPLY result={ar} commit={cr}");
+                }
+              }
+              if(!any)sb.AppendLine("NO_DEVICE_EXPOSES_EXACT_MODE");
+              return sb.ToString();
+            }
+          }
+          '@
+
+          & "$env:SystemRoot\System32\DisplaySwitch.exe" /extend | Out-Null
+          Start-Sleep -Seconds 4
+
+          $passed=$false
+          for($attempt=1;$attempt -le 8;$attempt++){
+            Write-Host "=== exact display attempt $attempt ==="
+            $dump=[PRDPExactDisplay235]::Dump($w,$h,$hz)
+            Write-Host $dump
+            if($dump -match 'EXACT_EXPOSED=True'){
+              $apply=[PRDPExactDisplay235]::Apply($w,$h,$hz)
+              Write-Host $apply
+              Start-Sleep -Seconds 3
+            } else {
+              & "$env:SystemRoot\System32\DisplaySwitch.exe" /extend | Out-Null
+              Start-Sleep -Seconds 2
+            }
+            if(Test-ExactActive){$passed=$true;break}
+          }
+
+          if(-not $passed){
+            Write-Host '=== final PnP ==='
+            Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Format-Table -AutoSize
+            Write-Host '=== final display dump ==='
+            Write-Host ([PRDPExactDisplay235]::Dump($w,$h,$hz))
+            throw "DISPLAY_EXACT_FAILED expected=${w}x${h}@${hz}; streaming intentionally not started"
+          }
+
+          Write-Host "PASS_EXACT_ACTIVE ${w}x${h}@${hz}"
+          try{
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 600
+            Start-Process explorer.exe
+            Start-Sleep -Seconds 2
+            Get-Process explorer -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "explorer pid=$($_.Id) session=$($_.SessionId)" }
+            Get-Process pwsh -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { Write-Host "pwsh pid=$($_.Id) session=$($_.SessionId)" }
+          }catch{ Write-Host "Explorer refresh non-fatal: $_" }
+          "RDP_EXACT_DISPLAY=1" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+
+
+      - name: Install fixed virtual audio endpoint - hard required
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Write-Host '=== PrivateRDP v2.3.6 virtual audio bootstrap ==='
+          $tmp=Join-Path $env:RUNNER_TEMP 'prdp-v236-vad'
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+
+          $rel=Invoke-RestMethod -Headers @{ 'User-Agent'='PrivateRDP-v2.3.8' } -Uri 'https://api.github.com/repos/VirtualDrivers/Virtual-Audio-Driver/releases/tags/25.7.14'
+          $asset=$rel.assets | Where-Object { $_.name -match '\.zip$' } | Select-Object -First 1
+          if(-not $asset){ throw 'Virtual Audio Driver 25.7.14 ZIP asset not found' }
+          $zip=Join-Path $tmp 'vad.zip'
+          Invoke-WebRequest $asset.browser_download_url -OutFile $zip -UseBasicParsing
+          $drv=Join-Path $tmp 'drv'
+          Expand-Archive $zip $drv -Force
+          $inf=Get-ChildItem $drv -Recurse -Filter VirtualAudioDriver.inf | Select-Object -First 1
+          $cat=Get-ChildItem $drv -Recurse -Filter virtualaudiodriver.cat | Select-Object -First 1
+          if(-not $inf){ throw 'VirtualAudioDriver.inf missing from signed release' }
+
+          if($cat){
+            try{
+              $certs=New-Object Security.Cryptography.X509Certificates.X509Certificate2Collection
+              $certs.Import([IO.File]::ReadAllBytes($cat.FullName))
+              foreach($c in $certs){
+                $cp=Join-Path $tmp ($c.Thumbprint+'.cer')
+                [IO.File]::WriteAllBytes($cp,$c.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+                Import-Certificate -FilePath $cp -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+              }
+            }catch{ Write-Warning "VAD catalog certificate import: $_" }
+          }
+
+          $nefZip=Join-Path $tmp 'nefcon.zip'
+          Invoke-WebRequest 'https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip' -OutFile $nefZip -UseBasicParsing
+          $nef=Join-Path $tmp 'nef'
+          Expand-Archive $nefZip $nef -Force
+          $nefexe=Get-ChildItem $nef -Recurse -Filter nefconw.exe | Where-Object FullName -Match '\\x64\\' | Select-Object -First 1
+          if(-not $nefexe){ throw 'nefconw x64 missing' }
+          & $nefexe.FullName install $inf.FullName 'ROOT\VirtualAudioDriver' 2>&1 | ForEach-Object { Write-Host $_ }
+          pnputil /scan-devices 2>&1 | ForEach-Object { Write-Host $_ }
+          Start-Sleep -Seconds 8
+          try { Set-Service AudioEndpointBuilder -StartupType Automatic; Start-Service AudioEndpointBuilder } catch {}
+          try { Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv } catch {}
+          Start-Sleep -Seconds 4
+
+          $nodes=Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VirtualAudioDriver' -or $_.FriendlyName -match 'Virtual Audio' }
+          if(-not $nodes){ throw 'Virtual Audio Driver PnP node not found' }
+          $healthy=$false
+          foreach($d in $nodes){
+            $pc=999
+            try{$pc=[int](Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop).Data}catch{}
+            Write-Host "VAD PnP: status=$($d.Status) name=$($d.FriendlyName) id=$($d.InstanceId) problem=$pc"
+            if($pc -eq 0){$healthy=$true}
+          }
+          if(-not $healthy){throw 'Virtual Audio Driver did not reach ProblemCode 0'}
+
+          python -c "import soundcard as sc; print('speakers=', [x.name for x in sc.all_speakers()]); s=sc.default_speaker(); print('default=', None if s is None else s.name); assert s is not None, 'no default render endpoint'"
+
+      - name: Materialize v2.4.0 host
+        shell: pwsh
+        run: |
+          $b64='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'
+          $path=Join-Path $env:RUNNER_TEMP 'prdp_v240_host.py'
+          $ms=New-Object IO.MemoryStream(,[Convert]::FromBase64String($b64))
+          $gz=New-Object IO.Compression.GZipStream($ms,[IO.Compression.CompressionMode]::Decompress)
+          $out=New-Object IO.MemoryStream
+          $gz.CopyTo($out)
+          [IO.File]::WriteAllBytes($path,$out.ToArray())
+          python -m py_compile $path
+          "RDP_HOST_SCRIPT=$path" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Host script ready: $path"
+
+      - name: Run PrivateRDP v2.4.0
+        shell: pwsh
+        env:
+          RDP_ROOM: ${{ inputs.room_code }}
+          RDP_WIDTH: ${{ inputs.width }}
+          RDP_HEIGHT: ${{ inputs.height }}
+          RDP_FPS: ${{ inputs.fps }}
+          RDP_BITRATE_MBPS: ${{ inputs.bitrate_mbps }}
+          RDP_CRF: ${{ inputs.crf }}
+          RDP_SNDBUF_KB: ${{ inputs.sndbuf_kb }}
+          RDP_WINDOW_GUARD: ${{ inputs.window_guard }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $room=($env:RDP_ROOM -replace '[^A-Za-z0-9]','').ToUpperInvariant()
+          if($room.Length -lt 12){throw 'room_code must contain at least 12 alphanumeric characters'}
+          $bytes=New-Object byte[] 24
+          [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $token=([Convert]::ToHexString($bytes)).ToLowerInvariant()
+          $generation="${{ github.run_id }}-${{ github.run_attempt }}"
+          $started=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $env:RDP_ROOM=$room
+          $env:RDP_SESSION_TOKEN=$token
+          $env:RDP_GENERATION=$generation
+          $env:RDP_STARTED_AT_MS=$started.ToString()
+          $env:RDP_UDP_PORT='49100'
+          $env:RDP_TCP_PORT='49101'
+          $env:RDP_VIDEO_PORT='49102'
+          $env:RDP_AUDIO_PORT='49103'
+          $env:RDP_AUDIO_RATE='48000'
+          $env:DXCAM_WINRT_CURSOR_CAPTURE='0' # deterministic: cursor is composited by the host for every backend
+          $env:DXCAM_WINRT_BORDER_REQUIRED='0'
+          $env:DXCAM_WINRT_FRAME_WAIT_MS='0'
+          $env:DXCAM_WINRT_MIN_UPDATE_INTERVAL_MS='0'
+          $env:DXCAM_WINRT_FRAME_POOL_SIZE='2'
+          Write-Host '=== PrivateRDP v2.3.9 GUARANTEED SERVER CURSOR + FAST CONNECT + VIRTUAL AUDIO ==='
+          Write-Host "Room       : $room"
+          Write-Host "Generation : $generation"
+          Write-Host "Tailnet IP : $env:RDP_TAILSCALE_IP"
+          Write-Host "Stream     : $env:RDP_WIDTH x $env:RDP_HEIGHT @ $env:RDP_FPS fps"
+          Write-Host "Bitrate    : cap $env:RDP_BITRATE_MBPS Mbps, CRF $env:RDP_CRF, sndbuf $env:RDP_SNDBUF_KB KB, window guard $env:RDP_WINDOW_GUARD"
+          Write-Host 'Display    : HARD exact VDD source required; native 1:1; crop=0 stretch=0 letterbox=0'
+          Write-Host 'Mouse      : actual Runner cursor position composited into every frame + latest-only CONTROL-TCP MOVE'
+          Write-Host 'Transport  : UDP liveness + TCP mouse/control + H264/TCP video + PCM/TCP audio over Tailscale'
+          python -u $env:RDP_HOST_SCRIPT
